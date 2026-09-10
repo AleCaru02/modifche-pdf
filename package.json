@@ -1,0 +1,16 @@
+{
+  "name": "modifiche-pdf",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite"
+  },
+  "dependencies": {
+    "mupdf": "1.28.1"
+  },
+  "devDependencies": {
+    "vite": "^7.1.5"
+  }
+}
