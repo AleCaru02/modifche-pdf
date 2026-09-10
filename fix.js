@@ -20,7 +20,8 @@ function showFixToast(message, duration = 4500) {
 }
 
 function pointer(target, type, clientX, clientY, buttons = 1) {
-  target.dispatchEvent(new PointerEvent(type, {
+  const EventCtor = window.PointerEvent || window.MouseEvent;
+  target.dispatchEvent(new EventCtor(type, {
     bubbles: true, cancelable: true, pointerId: 77, pointerType: 'mouse',
     isPrimary: true, buttons, clientX, clientY
   }));
@@ -82,20 +83,77 @@ function createOverlay(sheet, className, zIndex) {
   return layer;
 }
 
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const existing = [...document.scripts].find((script) => script.src === src);
+    if (existing) {
+      if (window.Tesseract) return resolve();
+      existing.addEventListener('load', resolve, { once: true });
+      existing.addEventListener('error', reject, { once: true });
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.crossOrigin = 'anonymous';
+    script.onload = resolve;
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+}
+
+async function loadTesseract() {
+  if (window.Tesseract?.createWorker) return window.Tesseract;
+
+  const sources = [
+    'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js',
+    'https://unpkg.com/tesseract.js@5.1.1/dist/tesseract.min.js'
+  ];
+
+  let lastError;
+  for (const src of sources) {
+    try {
+      await loadScript(src);
+      if (window.Tesseract?.createWorker) return window.Tesseract;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error('Tesseract non caricato');
+}
+
+function makeOcrCanvas(source) {
+  const maxSide = /iPhone|iPad|iPod/i.test(navigator.userAgent) ? 1600 : 2200;
+  const longest = Math.max(source.width, source.height);
+  if (!longest || longest <= maxSide) return { canvas: source, scale: 1 };
+  const scale = maxSide / longest;
+  const reduced = document.createElement('canvas');
+  reduced.width = Math.max(1, Math.round(source.width * scale));
+  reduced.height = Math.max(1, Math.round(source.height * scale));
+  reduced.getContext('2d', { alpha: false }).drawImage(source, 0, 0, reduced.width, reduced.height);
+  return { canvas: reduced, scale };
+}
+
 async function initFix() {
+  if (window.__pdfFixInitialized) return;
+  window.__pdfFixInitialized = true;
+
   const sheet = document.querySelector('#sheet');
   const tools = document.querySelector('#tools');
   const canvas = document.querySelector('#canvas');
-  if (!sheet || !tools || !canvas) return;
+  if (!sheet || !tools || !canvas) {
+    window.__pdfFixInitialized = false;
+    return;
+  }
 
   const style = document.createElement('style');
   style.textContent = `
     #textLayer,.text-layer{z-index:30!important}
     #layer,.layer{z-index:29!important}
     .text-hit{pointer-events:auto!important;cursor:text!important}
-    .pdf-fix-hit{position:absolute;padding:0;margin:0;border:1px dashed #1769e0;background:#1769e014;color:transparent;cursor:text;border-radius:2px}
+    .pdf-fix-hit{position:absolute;padding:0;margin:0;border:1px dashed #1769e0;background:#1769e014;color:transparent;cursor:text;border-radius:2px;touch-action:manipulation}
     .pdf-fix-hit:hover{background:#1769e02b;border-style:solid}
-    .pdf-fix-selecting{cursor:crosshair;background:#1769e008}
+    .pdf-fix-selecting{cursor:crosshair;background:#1769e008;touch-action:none}
     .pdf-fix-box{position:absolute;border:2px dashed #1769e0;background:#1769e018;pointer-events:none}
   `;
   document.head.appendChild(style);
@@ -158,32 +216,43 @@ async function initFix() {
       setSelecting(false);
       await replaceAreaWithExistingTools(rect);
     };
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
-  });
+    window.addEventListener('pointermove', move, { passive: false });
+    window.addEventListener('pointerup', up, { passive: false });
+  }, { passive: false });
 
   let worker = null;
   let running = false;
+
+  async function createOcrWorker(Tesseract) {
+    const options = {
+      workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
+      langPath: 'https://tessdata.projectnaptha.com/4.0.0',
+      logger: (message) => {
+        if (message.status === 'recognizing text') {
+          ocrButton.textContent = `OCR ${Math.round((message.progress || 0) * 100)}%`;
+        }
+      }
+    };
+    return Tesseract.createWorker(['ita', 'eng'], 1, options);
+  }
+
   async function runOcr() {
     if (running) return;
     if (!canvas.width) return showFixToast('Carica prima un PDF.');
     running = true;
     ocrButton.disabled = true;
     ocrLayer.innerHTML = '';
-    showFixToast('OCR in avvio. La prima analisi può richiedere alcuni secondi.', 8000);
+    showFixToast('OCR in avvio. Su iPhone la prima analisi può richiedere 10–30 secondi.', 10000);
     try {
-      const Tesseract = await import('https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.esm.min.js');
-      worker ||= await Tesseract.createWorker(['ita', 'eng'], 1, {
-        logger: (message) => {
-          if (message.status === 'recognizing text') {
-            ocrButton.textContent = `OCR ${Math.round((message.progress || 0) * 100)}%`;
-          }
-        }
-      });
-      const result = await worker.recognize(canvas);
+      const Tesseract = await loadTesseract();
+      if (!worker) worker = await createOcrWorker(Tesseract);
+
+      const prepared = makeOcrCanvas(canvas);
+      const result = await worker.recognize(prepared.canvas);
       const words = (result.data.words || []).filter((word) => word.text?.trim() && (word.confidence ?? 100) >= 25);
-      const scaleX = canvas.getBoundingClientRect().width / canvas.width;
-      const scaleY = canvas.getBoundingClientRect().height / canvas.height;
+      const scaleX = canvas.getBoundingClientRect().width / canvas.width / prepared.scale;
+      const scaleY = canvas.getBoundingClientRect().height / canvas.height / prepared.scale;
+
       for (const word of words) {
         const rect = {
           left: word.bbox.x0 * scaleX, top: word.bbox.y0 * scaleY,
@@ -211,20 +280,25 @@ async function initFix() {
       showFixToast(words.length ? `OCR completato: ${words.length} parole cliccabili.` : 'OCR non ha trovato parole. Usa “Modifica area”.', 6000);
     } catch (error) {
       console.error('OCR error', error);
-      showFixToast('OCR non disponibile. Usa “Modifica area”: funziona su qualunque PDF.', 6000);
+      if (worker) {
+        try { await worker.terminate(); } catch {}
+        worker = null;
+      }
+      showFixToast('OCR non disponibile su questa rete/browser. Usa “Modifica area” oppure ricarica e riprova.', 7000);
     } finally {
       running = false;
       ocrButton.disabled = false;
       ocrButton.textContent = 'Rileva testo con OCR';
     }
   }
+
   ocrButton.addEventListener('click', runOcr);
 
   const observer = new MutationObserver(() => {
     if (!sheet.classList.contains('hide') && canvas.width) {
       const nativeHits = document.querySelectorAll('.text-hit').length;
       if (!nativeHits && !running && !ocrLayer.children.length) {
-        setTimeout(runOcr, 250);
+        setTimeout(runOcr, 400);
       }
     }
   });
@@ -240,7 +314,7 @@ async function initFix() {
 
   setTimeout(() => {
     if (!sheet.classList.contains('hide') && canvas.width && !document.querySelector('.text-hit')) runOcr();
-  }, 1000);
+  }, 1200);
   window.addEventListener('beforeunload', () => worker?.terminate?.());
 }
 
