@@ -23,8 +23,9 @@ import * as mupdf from 'mupdf';
   css.textContent = `
     .mupdf-hit-layer{position:absolute;inset:0;z-index:130;pointer-events:none}
     .mupdf-hit{position:absolute;padding:0;margin:0;border:1px solid transparent;background:transparent;pointer-events:auto;cursor:text;border-radius:2px}
-    .mupdf-hit:hover,.mupdf-hit:focus{border-color:#1769e0;background:#1769e010;outline:none}
-    .mupdf-hit.edited{border-color:#148143aa;background:#1481430d}
+    .mupdf-hit:hover,.mupdf-hit:focus{border-color:#1769e0;background:#1769e008;outline:none}
+    .mupdf-hit.edited{border-color:transparent!important;background:transparent!important}
+    .mupdf-hit.edited:hover,.mupdf-hit.edited:focus{border-color:#1769e0!important;background:#1769e008!important}
     .mupdf-modal{position:fixed;inset:0;z-index:20000;background:#0b122066;display:grid;place-items:center;padding:16px}
     .mupdf-card{width:min(460px,calc(100vw - 28px));background:#fff;border-radius:14px;padding:18px;box-shadow:0 18px 60px #0005;font:14px system-ui,sans-serif}
     .mupdf-card h3{margin:0 0 7px;font-size:18px}.mupdf-card p{margin:0 0 12px;color:#5d6879;font-size:12px;line-height:1.45}
@@ -51,9 +52,7 @@ import * as mupdf from 'mupdf';
     toast.timer = setTimeout(() => el.classList.add('hide'), 4200);
   }
 
-  function destroyDoc(doc){
-    try { doc?.destroy?.(); } catch {}
-  }
+  function destroyDoc(doc){ try { doc?.destroy?.(); } catch {} }
 
   function rectFromBox(box){
     if (!box) return null;
@@ -85,10 +84,19 @@ import * as mupdf from 'mupdf';
           if (!text.trim()) continue;
           const rect = rectFromBox(line.bbox);
           if (!rect) continue;
+          const font = line.font || {};
           spans.push({
             id: id++, page: pageIndex, text, rect,
-            font: line.font || {},
-            x: Number(line.x ?? rect[0]), y: Number(line.y ?? rect[3])
+            font: {
+              name: String(font.name || ''),
+              family: String(font.family || ''),
+              weight: String(font.weight || 'normal'),
+              style: String(font.style || 'normal'),
+              size: Number(font.size || 0)
+            },
+            x: Number(line.x ?? rect[0]),
+            y: Number(line.y ?? rect[3]),
+            wmode: Number(line.wmode || 0)
           });
         }
       }
@@ -100,11 +108,18 @@ import * as mupdf from 'mupdf';
     }
   }
 
-  function fontAlias(font){
+  function base14Font(font){
     const family = String(font?.family || '').toLowerCase();
-    if (family.includes('mono')) return 'Cour';
-    if (family.includes('serif')) return 'TiRo';
-    return 'Helv';
+    const name = String(font?.name || '').toLowerCase();
+    const weight = String(font?.weight || '').toLowerCase();
+    const style = String(font?.style || '').toLowerCase();
+    const bold = weight.includes('bold') || weight.includes('700') || name.includes('bold');
+    const italic = style.includes('italic') || style.includes('oblique') || name.includes('italic') || name.includes('oblique');
+    const mono = family.includes('mono') || name.includes('courier');
+    const serif = !mono && (family.includes('serif') || name.includes('times'));
+    if (mono) return bold ? (italic ? 'Courier-BoldOblique' : 'Courier-Bold') : (italic ? 'Courier-Oblique' : 'Courier');
+    if (serif) return bold ? (italic ? 'Times-BoldItalic' : 'Times-Bold') : (italic ? 'Times-Italic' : 'Times-Roman');
+    return bold ? (italic ? 'Helvetica-BoldOblique' : 'Helvetica-Bold') : (italic ? 'Helvetica-Oblique' : 'Helvetica');
   }
 
   function isMostlyNumber(text){
@@ -120,12 +135,75 @@ import * as mupdf from 'mupdf';
     return annot;
   }
 
+  function pdfEscapeText(value){
+    return String(value ?? '')
+      .replace(/\\/g,'\\\\')
+      .replace(/\(/g,'\\(')
+      .replace(/\)/g,'\\)')
+      .replace(/\r/g,'')
+      .replace(/\n/g,' ');
+  }
+
+  function textWidth(fontName, fontSize, value){
+    let font = null;
+    try {
+      font = new mupdf.Font(fontName);
+      let total = 0;
+      for (const ch of String(value ?? '')) {
+        const gid = font.encodeCharacter(ch.codePointAt(0));
+        total += Number(font.advanceGlyph(gid, 0) || 0) * fontSize;
+      }
+      return total;
+    } catch {
+      return String(value ?? '').length * fontSize * 0.52;
+    } finally {
+      try { font?.destroy?.(); } catch {}
+    }
+  }
+
+  function appendDirectText(doc, page, edit){
+    const fontName = base14Font(edit.font);
+    const fontSize = Math.max(3, Number(edit.font?.size || (edit.rect[3]-edit.rect[1]) * 0.8 || 10));
+    const pageObj = page.getObject();
+    let resources = pageObj.get('Resources');
+    if (!resources.isDictionary()) pageObj.put('Resources', resources = doc.newDictionary());
+    let fonts = resources.get('Font');
+    if (!fonts.isDictionary()) resources.put('Font', fonts = doc.newDictionary());
+
+    const resourceName = `ME${Math.abs((edit.key || '').split('').reduce((a,c)=>((a*31+c.charCodeAt(0))|0),7))}`;
+    const font = new mupdf.Font(fontName);
+    const fontResource = doc.addSimpleFont(font);
+    fonts.put(resourceName, fontResource);
+
+    const bounds = page.getBounds();
+    let x = Number(edit.x);
+    const baselineTop = Number(edit.y);
+    const y = Number(bounds[3]) - baselineTop;
+
+    if (isMostlyNumber(edit.originalText)) {
+      const originalRight = Number(edit.rect[2]);
+      const w = textWidth(fontName, fontSize, edit.text);
+      x = originalRight - w;
+    }
+
+    const value = pdfEscapeText(edit.text);
+    const streamText = `q BT 0 0 0 rg /${resourceName} ${fontSize.toFixed(4)} Tf 1 0 0 1 ${x.toFixed(4)} ${y.toFixed(4)} Tm (${value}) Tj ET Q`;
+    const extra = doc.addStream(streamText, null);
+    const contents = pageObj.get('Contents');
+    if (contents.isNull()) pageObj.put('Contents', extra);
+    else if (contents.isArray()) contents.push(extra);
+    else {
+      const arr = doc.newArray();
+      arr.push(contents); arr.push(extra);
+      pageObj.put('Contents', arr);
+    }
+    try { font.destroy?.(); } catch {}
+  }
+
   function applyOneEdit(pdfDoc, edit){
     const page = pdfDoc.loadPage(edit.page);
     try {
       const [x0,y0,x1,y1] = edit.rect;
-      const h = Math.max(1, y1 - y0);
-      // Tight text-only redaction: no black/white box and line art/images are preserved.
       addRedaction(page, [x0, y0, x1, y1]);
       page.applyRedactions(
         false,
@@ -133,16 +211,7 @@ import * as mupdf from 'mupdf';
         mupdf.PDFPage.REDACT_LINE_ART_NONE,
         mupdf.PDFPage.REDACT_TEXT_REMOVE
       );
-
-      const free = page.createAnnotation('FreeText');
-      const padY = Math.max(0.4, h * 0.08);
-      free.setRect([x0, y0 - padY, Math.max(x1, x0 + 2), y1 + padY]);
-      free.setContents(edit.text);
-      const size = Math.max(4, Number(edit.font?.size || h * 0.78 || 10));
-      free.setDefaultAppearance(fontAlias(edit.font), size, [0,0,0]);
-      try { free.setBorderWidth(0); } catch {}
-      try { free.setQuadding(isMostlyNumber(edit.originalText) ? 2 : 0); } catch {}
-      free.update?.();
+      appendDirectText(pdfDoc, page, edit);
       page.update?.();
     } finally {
       try { page.destroy?.(); } catch {}
@@ -155,8 +224,6 @@ import * as mupdf from 'mupdf';
     const pdfDoc = opened.asPDF ? opened.asPDF() : opened;
     try {
       for (const edit of edits) applyOneEdit(pdfDoc, edit);
-      // Convert replacement FreeText appearances to normal page content.
-      pdfDoc.bake?.(true, false);
       const buffer = pdfDoc.saveToBuffer('garbage,compress');
       const out = buffer.asUint8Array().slice();
       try { buffer.destroy?.(); } catch {}
@@ -211,7 +278,7 @@ import * as mupdf from 'mupdf';
     const existing = edits.find(e => e.key === key);
     const modal = document.createElement('div');
     modal.className = 'mupdf-modal';
-    modal.innerHTML = `<div class="mupdf-card"><h3>Sostituisci testo</h3><p>Il testo originale viene rimosso dal contenuto renderizzato del PDF e il nuovo testo viene inserito senza riquadro bianco.</p><textarea rows="2"></textarea><div class="mupdf-actions"><button class="cancel">Annulla</button><button class="apply">Sostituisci</button></div></div>`;
+    modal.innerHTML = `<div class="mupdf-card"><h3>Sostituisci testo</h3><p>Il testo viene rimosso e riscritto direttamente sulla baseline originale, senza riquadro di testo.</p><textarea rows="2"></textarea><div class="mupdf-actions"><button class="cancel">Annulla</button><button class="apply">Sostituisci</button></div></div>`;
     document.body.appendChild(modal);
     const field = modal.querySelector('textarea');
     field.value = existing?.text ?? span.text;
@@ -219,7 +286,7 @@ import * as mupdf from 'mupdf';
     modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
     modal.querySelector('.apply').onclick = async () => {
       const text = String(field.value ?? '');
-      const payload = {key,page:span.page,spanId:span.id,originalText:span.text,text,rect:span.rect,font:span.font};
+      const payload = {key,page:span.page,spanId:span.id,originalText:span.text,text,rect:span.rect,font:span.font,x:span.x,y:span.y,wmode:span.wmode};
       if (existing) Object.assign(existing,payload); else edits.push(payload);
       modal.remove();
       rebuildHits();
@@ -256,7 +323,7 @@ import * as mupdf from 'mupdf';
         button.onclick=(e)=>{e.preventDefault();e.stopPropagation();openEditor(span);};
         hitLayer.appendChild(button);
       }
-      if (tip) tip.innerHTML = `<b>Motore MuPDF:</b> ${spans.length} elementi testuali rilevati. Clicca direttamente su quello che vuoi sostituire.`;
+      if (tip) tip.innerHTML = `<b>Motore MuPDF:</b> ${spans.length} elementi rilevati. Il nuovo testo usa dimensione, stile e baseline estratti dal PDF.`;
     } finally {
       try { page.destroy?.(); } catch {}
     }
